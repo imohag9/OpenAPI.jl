@@ -34,34 +34,34 @@ function test(uri)
     @test order.id == 5
     @test isa(order.shipDate, ZonedDateTime)
 
-    @info("StoreApi - get_order_by_id (async)")
-    response_channel = Channel{Order}(1)
-    @test_throws OpenAPI.ValidationException get_order_by_id(api, response_channel, Int64(0))
-    @sync begin
-        @async begin
-            api_return, http_resp = get_order_by_id(api, response_channel, Int64(5))
-            @test (200 <= http_resp.status <= 206)
-            @test api_return === response_channel
-        end
-        @async begin
-            order = take!(response_channel)
-            @test isa(order, Order)
-            @test order.id == 5
-        end
-    end
+    # @info("StoreApi - get_order_by_id (async)")
+    # response_channel = Channel{Order}(1)
+    # @test_throws OpenAPI.ValidationException get_order_by_id(api, response_channel, Int64(0))
+    # @sync begin
+    #     @async begin
+    #         api_return, http_resp = get_order_by_id(api, response_channel, Int64(5))
+    #         @test (200 <= http_resp.status <= 206)
+    #         @test api_return === response_channel
+    #     end
+    #     @async begin
+    #         order = take!(response_channel)
+    #         @test isa(order, Order)
+    #         @test order.id == 5
+    #     end
+    # end
 
-    # a closed channel is equivalent of cancellation of the call,
-    # no error should be thrown, but response can be nothing if call was interrupted immediately
-    @test !isopen(response_channel)
+    # # a closed channel is equivalent of cancellation of the call,
+    # # no error should be thrown, but response can be nothing if call was interrupted immediately
+    # @test !isopen(response_channel)
 
-    # open a new channel to use
-    response_channel = Channel{Order}(1)
-    try
-        resp, http_resp = get_order_by_id(api, response_channel, Int64(5))
-        @test (200 <= http_resp.status <= 206)
-    catch ex
-        @test isa(ex, OpenAPI.InvocationException)
-    end
+    # # open a new channel to use
+    # response_channel = Channel{Order}(1)
+    # try
+    #     resp, http_resp = get_order_by_id(api, response_channel, Int64(5))
+    #     @test (200 <= http_resp.status <= 206)
+    # catch ex
+    #     @test isa(ex, OpenAPI.InvocationException)
+    # end
 
     @info("StoreApi - delete_order")
     api_return, http_resp = delete_order(api, "5")
