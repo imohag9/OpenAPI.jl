@@ -1,6 +1,6 @@
 ```@contents
 Pages = ["reference.md"]
-Depth = 3
+Depth = 2
 ```
 
 ```@meta
@@ -22,9 +22,7 @@ Clients.set_timeout
 ## Examining Models
 
 ```@docs
-hasproperty
-getproperty
-setproperty!
+
 Clients.getpropertyat
 Clients.haspropertyat
 ```

@@ -32,7 +32,7 @@ include("deep_object/deep_client.jl")
             end
         end
     end
-    run_tests_with_servers && !openapi_generator_env && sleep(20) # avoid port conflicts
+    #run_tests_with_servers && !openapi_generator_env && sleep(20) # avoid port conflicts
     # @testset "Petstore Server" begin
     #     v2_ret = v2_out = v3_ret = v3_out = nothing
     #     servers_running = true
@@ -199,7 +199,7 @@ include("deep_object/deep_client.jl")
             run_tests_with_servers && stop_server(8081, ret, out)
         end
     end
-    run_tests_with_servers && sleep(20) # avoid port conflicts
+    #run_tests_with_servers && sleep(20) # avoid port conflicts
 
 
 end
