@@ -583,114 +583,122 @@ function do_request(ctx::Ctx, stream::Bool=false; stream_to::Union{Channel,Nothi
     resource_path, body, headers = ctx.pre_request_hook(resource_path, body, kwargs[:headers])
     kwargs[:headers] = headers
 
-    if body !== nothing
-        input = PipeBuffer()
-        write(input, body)
-    else
-        input = nothing
-    end
+    input = (body === nothing) ? nothing : IOBuffer(body)
 
     if stream
         @assert stream_to !== nothing
     end
 
-    resp = nothing
-    output = Base.BufferStream()
+    if stream
+        #
+        # This block is the core of the fix.
+        # It replaces the problematic Downloads.jl @sync block with HTTP.open,
+        # which correctly separates header/status reception from body streaming.
+        #
+        resp_ref = Ref{Any}(nothing)
+        http_body = (input === nothing) ? HTTP.nobody : read(input)
 
-    try
-        if stream
-            interrupt = nothing
-            if ctx.client.request_interrupt_supported
-                kwargs[:interrupt] = interrupt = Base.Event()
-            end
-            @sync begin
-                download_task = @async begin
-                    try
-                        resp = Downloads.request(resource_path;
-                            input=input,
-                            output=output,
-                            kwargs...
-                        )
-                    catch ex
-                        # If request method does not support interrupt natively, InterrptException is used to
-                        # signal the download task to stop. Otherwise, InterrptException is not handled and is rethrown.
-                        # Any exception other than InterruptException is rethrown always.
-                        if ctx.client.request_interrupt_supported || !isa(ex, InterruptException)
-                            @error("exception invoking request", exception=(ex,catch_backtrace()))
-                            rethrow()
-                        end
-                    finally
-                        close(output)
-                    end
+        try
+            HTTP.open(kwargs[:method], resource_path, kwargs[:headers], http_body;
+                      connect_timeout=ctx.timeout, readtimeout=ctx.timeout,
+                      verbose=get(ctx.client.clntoptions, :verbose, false) ? 2 : 0) do http_stream
+
+                # Create a Downloads.Response-compatible object as soon as headers are available.
+                # This makes the fix compatible with the rest of the code (e.g., the `response` function).
+                http_resp_msg = http_stream.message
+                resp = Downloads.Response("HTTP", string(http_resp_msg.uri), http_resp_msg.status, "", http_resp_msg.headers)
+                resp_ref[] = resp
+
+                if HTTP.iserror(http_stream)
+                    # To maintain exception compatibility, create and throw an ApiException
+                    err_body = read(http_stream)
+                    resp_with_body = Downloads.Response(resp.proto, resp.url, resp.status, String(err_body), resp.headers)
+                    req_err = Downloads.RequestError(resource_path, resp.status, resp.message, resp_with_body)
+                    # We can't throw directly from here as it will be caught by HTTP.jl.
+                    # Instead, we signal the error to the processing task.
+                    put!(stream_to, ApiException(req_err))
+                    return
                 end
-                @async begin
-                    try
-                        if isnothing(ctx.chunk_reader_type)
-                            default_return_type = ctx.client.get_return_type(ctx.return_types, nothing, "")
-                            readerT = default_return_type <: APIModel ? JSONChunkReader : LineChunkReader
-                        else
-                            readerT = ctx.chunk_reader_type
-                        end
-                        for chunk in readerT(output)
-                            return_type = ctx.client.get_return_type(ctx.return_types, nothing, String(copy(chunk)))
-                            data = response(return_type, resp, chunk)
-                            put!(stream_to, data)
-                        end
-                    catch ex
-                        if !isa(ex, InvalidStateException) && isopen(stream_to)
-                            @error("exception reading chunk", exception=(ex,catch_backtrace()))
-                            rethrow()
-                        end
-                    finally
-                        close(stream_to)
-                    end
-                end
-                @async begin
-                    interrupted = false
-                    while isopen(stream_to)
+
+                @sync begin
+                    # Task to process the streaming body
+                    @async begin
                         try
-                            wait(stream_to)
-                            yield()
-                        catch ex
-                            isa(ex, InvalidStateException) || rethrow(ex)
-                            interrupted = true
-                            if !istaskdone(download_task)
-                                # If the download task is still running, interrupt it.
-                                # If it supports interrupt natively, then use event to signal it.
-                                # Otherwise, throw an InterruptException to stop the download task.
-                                if ctx.client.request_interrupt_supported
-                                    notify(interrupt)
-                                else
-                                    schedule(download_task, InterruptException(), error=true)
+                            readerT = if isnothing(ctx.chunk_reader_type)
+                                default_return_type = ctx.client.get_return_type(ctx.return_types, resp.status, "")
+                                default_return_type <: APIModel ? JSONChunkReader : LineChunkReader
+                            else
+                                ctx.chunk_reader_type
+                            end
+                            
+                            reader = readerT(http_stream)
+                            for chunk in reader
+                                return_type = ctx.client.get_return_type(ctx.return_types, resp.status, String(copy(chunk)))
+                                data = response(return_type, resp, chunk)
+                                if !isopen(stream_to)
+                                    break
                                 end
+                                put!(stream_to, data)
+                            end
+                        catch ex
+                            if isopen(stream_to)
+                                @error("exception reading chunk", exception=(ex,catch_backtrace()))
+                                put!(stream_to, ex)
+                            end
+                        finally
+                            close(stream_to)
+                        end
+                    end
+
+                    # Task to handle cancellation from the consumer
+                    @async begin
+                        while isopen(stream_to)
+                            try
+                                wait(stream_to)
+                                yield()
+                            catch ex
+                                isa(ex, InvalidStateException) || rethrow(ex)
+                                close(http_stream) # Close the connection on interrupt
+                                break
                             end
                         end
-                    end
-                    if !interrupted && !istaskdone(download_task)
-                        if ctx.client.request_interrupt_supported
-                            notify(interrupt)
-                        else
-                            schedule(download_task, InterruptException(), error=true)
+                        # If the consumer loop finishes/closes the channel, ensure the stream is closed.
+                        if isopen(http_stream)
+                            close(http_stream)
                         end
                     end
                 end
             end
-        else
+        catch ex
+            # Capture exceptions during the HTTP.open call itself (e.g., connection refused)
+            resp_ref[] = ex
+        end
+
+        final_resp = resp_ref[]
+        if isa(final_resp, Exception)
+            throw(final_resp)
+        end
+        # The second element (output buffer) is not used by `exec` in the streaming path.
+        return final_resp, nothing
+    else
+        # Non-streaming path remains unchanged, using Downloads.jl
+        output = Base.BufferStream()
+        resp = nothing
+        try
             resp = Downloads.request(resource_path;
                         input=input,
                         output=output,
                         kwargs...
                     )
             close(output)
+        finally
+            if ctx.curl_mime_upload[] !== nothing
+                LibCURL.curl_mime_free(ctx.curl_mime_upload[])
+                ctx.curl_mime_upload[] = nothing
+            end
         end
-    finally
-        if ctx.curl_mime_upload[] !== nothing
-            LibCURL.curl_mime_free(ctx.curl_mime_upload[])
-            ctx.curl_mime_upload[] = nothing
-        end
+        return resp, output
     end
-
-    return resp, output
 end
 
 function exec(ctx::Ctx, stream_to::Union{Channel,Nothing}=nothing)
